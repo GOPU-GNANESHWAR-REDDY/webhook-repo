@@ -1,5 +1,5 @@
 import logging
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template
 from pymongo import MongoClient
 from datetime import datetime, timezone
 import os
@@ -18,30 +18,28 @@ logging.basicConfig(
 # Load environment variables from .env file
 load_dotenv()
 
-app = Flask(__name__)
+app = Flask(__name__, template_folder="templates", static_folder="static")
 
-# Use MONGO_URI from environment variables
+# Load MongoDB URI
 MONGO_URI = os.getenv("MONGO_URI")
-
 if not MONGO_URI:
     logging.error("MONGO_URI environment variable is missing")
     raise Exception("MONGO_URI environment variable is missing")
 
+# Load GitHub Webhook Secret
 GITHUB_SECRET = os.getenv("GITHUB_SECRET")
 if not GITHUB_SECRET:
     logging.error("GITHUB_SECRET environment variable is missing")
     raise Exception("GITHUB_SECRET environment variable is missing")
 
-# Create a MongoDB client
+# MongoDB connection
 client = MongoClient(MONGO_URI, tls=True, tlsAllowInvalidCertificates=False)
-
 db = client["webhooks_db"]
 collection = db["webhooks"]
 
-@app.route("/", methods=["GET"])
+@app.route("/")
 def index():
-    logging.info("Health check hit on root endpoint")
-    return "<h1>Webhook Receiver Active</h1>"
+    return render_template("index.html")
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -49,6 +47,7 @@ def webhook():
     signature = request.headers.get('X-Hub-Signature-256')
     body = request.data
 
+    # Verify signature
     if not signature:
         logging.warning("No X-Hub-Signature-256 header in request")
         return jsonify({"message": "Missing signature", "status": "failed"}), 400
@@ -59,7 +58,6 @@ def webhook():
         return jsonify({"message": "Invalid signature", "status": "failed"}), 403
 
     payload = request.get_json()
-
     if not payload:
         logging.warning("No data received in webhook")
         return jsonify({"message": "No data received", "status": "failed"}), 400
@@ -70,8 +68,55 @@ def webhook():
     timestamp = datetime.now(timezone.utc).strftime("%d %B %Y - %I:%M %p UTC")
 
     try:
-        # ... (rest of your existing code remains the same)
-        # Validations and MongoDB insert go here
+        if event == "ping":
+            logging.info("Received ping event from GitHub")
+            return jsonify({"message": "Ping received", "status": "success"}), 200
+
+        if event == "push":
+            pusher = payload.get("pusher", {})
+            ref = payload.get("ref")
+            if not pusher.get("name") or not ref:
+                logging.warning("Invalid push payload: missing pusher or ref")
+                return jsonify({"message": "Invalid push payload: missing pusher or ref", "status": "failed"}), 400
+
+            data = {
+                "action": "push",
+                "author": pusher["name"],
+                "to_branch": ref.split("/")[-1],
+                "from_branch": None,
+                "timestamp": timestamp
+            }
+
+        elif event == "pull_request":
+            pr = payload.get("pull_request", {})
+            action = payload.get("action")
+            if not action or not pr.get("user") or not pr.get("head") or not pr.get("base"):
+                logging.warning("Invalid pull_request payload: missing required fields")
+                return jsonify({"message": "Invalid pull_request payload", "status": "failed"}), 400
+
+            if action == "opened":
+                data = {
+                    "action": "pull_request",
+                    "author": pr["user"]["login"],
+                    "from_branch": pr["head"]["ref"],
+                    "to_branch": pr["base"]["ref"],
+                    "timestamp": timestamp
+                }
+            elif action == "closed" and pr.get("merged"):
+                data = {
+                    "action": "merge",
+                    "author": pr["user"]["login"],
+                    "from_branch": pr["head"]["ref"],
+                    "to_branch": pr["base"]["ref"],
+                    "timestamp": timestamp
+                }
+            else:
+                logging.info("Pull request not relevant")
+                return jsonify({"message": "Pull request not relevant", "status": "ignored"}), 200
+
+        else:
+            logging.info(f"Unhandled event type: {event}")
+            return jsonify({"message": f"Unhandled event: {event}", "status": "ignored"}), 200
 
         # Save to MongoDB
         collection.insert_one(data)
